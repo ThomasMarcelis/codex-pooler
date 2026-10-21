@@ -27,8 +27,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxSessionReplacementTest do
   @negative_mutations [:legacy_reason, :nonexpiry_close, :old_token_close, :earlier_creation, :foreign_key, :wrong_model, :epoch, :changed_prefix, :retry_window]
   # A comprehension expands and compiles a test's body once per generated test, so a loop that generates more than a few tests keeps
   # the scenario in a private function below it and each generated test is one call.
-  for mode <- ["full", "lite"], {carrier, state} <- [{:http, :same_session}, {:http, :replacement_fresh}, {:http, :replacement_engaged}, {:ws_direct, :replacement_fresh}, {:ws_owner, :replacement_fresh}] ++ Enum.map(@negative_mutations, &{:http, {:negative, &1}}) do
-    replacement? = state != :same_session
+  for mode <- ["full", "lite"], {carrier, state} <- [{:http, :same_session}, {:http, :replacement_fresh}, {:http, :replacement_engaged}, {:ws_direct, :replacement_fresh}, {:ws_owner, :replacement_fresh}, {:http, :window_successor}, {:ws_direct, :window_successor}, {:ws_owner, :window_successor}] ++ Enum.map(@negative_mutations, &{:http, {:negative, &1}}) do
+    replacement? = state not in [:same_session, :window_successor]
 
     mutation =
       case state do
@@ -41,6 +41,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxSessionReplacementTest do
     end
 
     if mutation, do: @tag(mailbox_replacement_negative: true)
+    if state == :window_successor, do: @tag(mailbox_window: true)
+    @tag window_successor?: state == :window_successor
     @tag mode: mode, carrier: carrier, replacement?: replacement?, engaged?: state == :replacement_engaged, mutation: mutation
     test "#{mode} #{carrier} mailbox continuation #{inspect(state)}", context do
       assert_mailbox_continuation!(context)
@@ -63,8 +65,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxSessionReplacementTest do
     Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, context.carrier == :ws_owner)
     set_model_serving_mode!(model_serving_scope(), setup, context.mode)
     thread = Ecto.UUID.generate()
-    Process.put({__MODULE__, :include_turn_state_header}, context.carrier != :http)
+    Process.put({__MODULE__, :include_turn_state_header}, context.carrier != :http and not context.window_successor?)
+    Process.put({__MODULE__, :window_successor?}, context.window_successor?)
     input = native_text_input("synthetic")
+    input = if context.window_successor?, do: input ++ [%{"type" => "compaction", "encrypted_content" => "synthetic-pivot"}], else: input
     payload = payload(setup, thread, input)
 
     Process.put({GatewayControllerHelpers, :owner_liveness_test_options}, %{bridge_owner_lease_ttl_seconds: 30, session_lease_heartbeat_test_observer: self()})
@@ -81,7 +85,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxSessionReplacementTest do
     session = Repo.get!(CodexSession, turn.codex_session_id)
     assert {first.status, attempt.status, turn.status} == {"succeeded", "succeeded", "succeeded"}
     assert attempt.transport == "http_sse"
-    assert first.request_metadata["native_http_claim_arm"] == "opening"
+    assert first.request_metadata["native_http_claim_arm"] == if(context.window_successor?, do: "post_compaction_resume", else: "opening")
     assert get_in(attempt.response_metadata, ["native_http_mailbox_prefix", "output_item_done_count"]) == 1
     assert_settled_once!(first.id)
 
@@ -137,6 +141,20 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxSessionReplacementTest do
         continuation
       end
 
+    continuation =
+      if context.window_successor? do
+        # A websocket reconnect opens the next window before HTTP fallback
+        # reaches it; the still-owned predecessor must remain a separate session.
+        {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+        options = RequestOptions.for_websocket(%{session_header: "#{thread}:1", session_header_source: "x-codex-window-id"})
+        assert {:ok, next_session} = SessionContinuity.start_codex_session(auth, options)
+        refute next_session.id == session.id
+        document = payload["client_metadata"]["x-codex-turn-metadata"] |> CodexPooler.JSON.decode!() |> Map.merge(%{"window_id" => "#{thread}:1", "window_number" => 1}) |> CodexPooler.JSON.encode!()
+        put_in(continuation, ["client_metadata", "x-codex-turn-metadata"], document)
+      else
+        continuation
+      end
+
     before = pool_counts(setup.pool.id)
     trace = start_admission_trace!()
     {response, logs} = with_info_log(fn -> send_carrier_request(setup, thread, continuation, context.mode, context.carrier) end)
@@ -164,8 +182,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxSessionReplacementTest do
       assert replacement.session_key == session.session_key
       if context.mutation == :earlier_creation, do: assert(DateTime.compare(replacement.created_at, old_session.closed_at) == :lt), else: assert(DateTime.compare(replacement.created_at, old_session.closed_at) in [:gt, :eq])
     else
-      assert length(sessions) == 1
+      assert length(sessions) == if(context.window_successor?, do: 2, else: 1)
       assert old_session.status == "active"
+      assert is_nil(old_session.close_reason)
     end
 
     terminal_predecessor? = String.contains?(logs, "resend_disposition=terminal_predecessor")
@@ -202,7 +221,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxSessionReplacementTest do
       admitted = Repo.one!(from r in Request, where: r.pool_id == ^setup.pool.id and fragment("?->'client_resend'->>'predecessor_request_id'", r.request_metadata) == ^first.id)
       admitted_turn = Repo.get_by!(CodexTurn, request_id: admitted.id)
       assert admitted.status == "succeeded"
-      assert admitted_turn.codex_session_id != session.id == context.replacement?
+      refute inspect(admitted.request_metadata) =~ "#{thread}:1"
+      assert admitted_turn.codex_session_id != session.id == (context.replacement? or context.window_successor?)
       assert admitted.request_metadata["client_resend"]["predecessor_request_id"] == first.id
       assert Repo.aggregate(from(l in RequestClientRetryLink, where: l.predecessor_request_id == ^first.id and l.successor_request_id == ^admitted.id), :count) == 1
       assert_settled_once!(admitted.id)
@@ -387,7 +407,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxSessionReplacementTest do
       |> auth(setup)
       |> put_req_header("session-id", thread)
       |> put_req_header("thread-id", thread)
-      |> put_req_header("x-codex-window-id", "#{thread}:0")
+      |> put_req_header("x-codex-window-id", payload_window(payload))
       |> put_req_header("x-codex-turn-metadata", payload["client_metadata"]["x-codex-turn-metadata"])
       |> put_req_header("originator", "codex_cli_rs")
 
@@ -401,9 +421,16 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxSessionReplacementTest do
   defp send_carrier_request(setup, thread, payload, mode, _websocket) do
     port = start_public_endpoint!()
     before = WebsocketCleanupFence.listener_sockets()
-    headers = [{"session-id", thread}, {"thread-id", thread}, {"x-codex-window-id", "#{thread}:0"}, {"originator", "codex_cli_rs"}]
+    headers = [{"session-id", thread}, {"thread-id", thread}, {"x-codex-window-id", payload_window(payload)}, {"originator", "codex_cli_rs"}]
     headers = if mode == "lite", do: [{"x-openai-internal-codex-responses-lite", "true"} | headers], else: headers
-    {conn, websocket, ref, _} = public_websocket_connect_with_request_headers!(port, setup, thread, @path, headers)
+
+    {conn, websocket, ref, _} =
+      if Process.get({__MODULE__, :window_successor?}) do
+        connect_window_socket!(port, setup, headers)
+      else
+        public_websocket_connect_with_request_headers!(port, setup, thread, @path, headers)
+      end
+
     socket = WebsocketCleanupFence.await_new_listener_socket!(before)
     enrollment = observe_carrier_task!(socket)
     on_exit(fn -> Mint.HTTP.close(conn) end)
@@ -414,6 +441,16 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMailboxSessionReplacementTest do
     Mint.HTTP.close(conn)
     :ok = WebsocketCleanupFence.await_listener_socket_cleanup!(socket)
     terminal
+  end
+
+  defp payload_window(payload), do: payload["client_metadata"]["x-codex-turn-metadata"] |> CodexPooler.JSON.decode!() |> Map.fetch!("window_id")
+
+  defp connect_window_socket!(port, setup, headers) do
+    {:ok, conn} = Mint.HTTP.connect(:http, "127.0.0.1", port, protocols: [:http1])
+    {:ok, conn, ref} = Mint.WebSocket.upgrade(:ws, conn, @path, [{"authorization", setup.authorization} | headers])
+    {:ok, conn, status, response_headers} = await_public_websocket_upgrade(conn, ref)
+    {conn, websocket} = mint_websocket_new!(conn, ref, status, response_headers)
+    {conn, websocket, ref, response_headers}
   end
 
   defp observe_carrier_task!(socket) do

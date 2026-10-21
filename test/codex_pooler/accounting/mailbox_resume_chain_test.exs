@@ -21,6 +21,13 @@ defmodule CodexPooler.Accounting.MailboxResumeChainTest do
     %{fixture: %{setup: setup, session: session, semantic: semantic, claim: claim, payload: payload}}
   end
 
+  for predecessor_transport <- ["websocket", "http_sse"], successor_transport <- ["websocket", "http_sse"] do
+    @tag mailbox_window: true
+    test "a cut #{predecessor_transport} turn continues in the next window through #{successor_transport}", %{fixture: fixture} do
+      assert_window_successor(fixture, unquote(predecessor_transport), unquote(successor_transport))
+    end
+  end
+
   for successor_transport <- ["websocket", "http_sse"] do
     test "two mailbox cuts traverse historical edges through #{successor_transport} successors", %{fixture: fixture} do
       original = admit!(fixture, fixture.payload, "websocket")
@@ -290,6 +297,163 @@ defmodule CodexPooler.Accounting.MailboxResumeChainTest do
     assert_refused!(fixture, append(fixture.payload, [output, mailbox(1)]), :terminal_predecessor)
   end
 
+  for transport <- ["websocket", "http_sse"], transition <- [:second_window, :replace_successor, :close_original, :expiry_then_window] do
+    @tag mailbox_composition: true
+    if transition != :second_window, do: @tag(slow: "observes actual lease replacement through the renewal and start APIs")
+
+    test "#{transport} historical authority composes #{transition}", %{fixture: fixture} do
+      assert_mailbox_composition(fixture, unquote(transport), unquote(transition))
+    end
+  end
+
+  for transport <- ["websocket", "http_sse"], mutation <- [:reversed, :skipped, :forged_current, :nonexpiry_close, :successor_session, :successor_witness] do
+    test "#{transport} historical mailbox edge refuses #{mutation}", %{fixture: fixture} do
+      assert_historical_refusal(fixture, unquote(transport), unquote(mutation))
+    end
+  end
+
+  test "returning to the ancestor's session cannot bypass its stored successor edge", %{fixture: fixture} do
+    thread = Ecto.UUID.generate()
+    previous = window_fixture(fixture, "#{thread}:2")
+    original = admit!(previous, fixture.payload, "websocket")
+    output = reasoning("ancestor-session")
+    cut!(previous, original, output)
+    successor = window_fixture(previous, "#{thread}:3")
+    candidate = append(fixture.payload, [output, mailbox(1)])
+    admitted = admit!(successor, candidate, "websocket")
+    next_output = reasoning("ancestor-successor")
+    cut!(successor, admitted, next_output)
+    scope = %{pool_id: fixture.setup.pool.id, api_key_id: fixture.setup.api_key.id, model_id: fixture.setup.model.id, endpoint: @endpoint, native_window_id: "#{thread}:2"}
+    witness = witness(previous, append(candidate, [next_output, mailbox(2)]), "websocket")
+    turn = Repo.get_by!(CodexTurn, request_id: original.id)
+    request = Repo.get!(Request, original.id)
+    attempt = Repo.get_by!(Attempt, request_id: original.id)
+    admitted = Repo.get!(Request, admitted.id)
+
+    assert {:ok, %{stage: :session}} = SessionContinuity.mailbox_admission_transaction(fn -> [previous.session.id, successor.session.id] end, fn -> ClientRetry.mailbox_check_for_session(turn, request, attempt, witness, admitted, previous.session.id, scope) end, :unexpected_rediscovery)
+  end
+
+  defp assert_historical_refusal(fixture, transport, mutation) do
+    thread = Ecto.UUID.generate()
+    previous = window_fixture(fixture, "#{thread}:2")
+    original = admit!(previous, fixture.payload, transport)
+    output = reasoning("historical-original")
+    cut!(previous, original, output)
+    middle = window_fixture(previous, "#{thread}:3")
+    first_payload = append(fixture.payload, [output, mailbox(1)])
+    first = admit!(middle, first_payload, transport)
+    next_output = reasoning("historical-next")
+    cut!(middle, first, next_output)
+    current = window_fixture(middle, "#{thread}:4")
+    current = invalidate_history!(mutation, previous, middle, current, first, thread)
+    candidate = append(first_payload, [next_output, mailbox(2)])
+    if transport == "websocket", do: assert_refused!(current, candidate, :terminal_predecessor), else: assert_http_refused!(current, candidate, :terminal_predecessor)
+    assert counts(current) == %{requests: 2, attempts: 2, turns: 2, links: 1, settlements: 2}
+  end
+
+  defp invalidate_history!(:reversed, previous, _middle, current, _first, thread) do
+    Repo.update_all(from(s in CodexSession, where: s.id == ^previous.session.id), set: [session_key: SessionContinuity.window_session_key("#{thread}:5")])
+    current
+  end
+
+  defp invalidate_history!(:skipped, previous, _middle, current, _first, thread) do
+    Repo.update_all(from(s in CodexSession, where: s.id == ^previous.session.id), set: [session_key: SessionContinuity.window_session_key("#{thread}:1")])
+    current
+  end
+
+  defp invalidate_history!(:forged_current, _previous, _middle, current, _first, _thread), do: %{current | native_window_id: "#{Ecto.UUID.generate()}:4"}
+
+  defp invalidate_history!(:nonexpiry_close, previous, _middle, current, _first, _thread) do
+    Repo.update_all(from(s in CodexSession, where: s.id == ^previous.session.id), set: [status: "closed", closed_at: db_now()])
+    current
+  end
+
+  defp invalidate_history!(:successor_session, _previous, middle, current, first, _thread) do
+    other = insert_session!(middle.setup)
+    Repo.update_all(from(t in CodexTurn, where: t.request_id == ^first.id), set: [codex_session_id: other.id])
+    current
+  end
+
+  defp invalidate_history!(:successor_witness, _previous, _middle, current, first, _thread) do
+    Repo.update_all(from(r in Request, where: r.id == ^first.id), set: [native_client_retry_digest: :crypto.strong_rand_bytes(32)])
+    current
+  end
+
+  defp assert_mailbox_composition(fixture, transport, transition) do
+    thread = Ecto.UUID.generate()
+    original_fixture = window_fixture(fixture, "#{thread}:2")
+    original = admit!(original_fixture, fixture.payload, transport)
+    first_output = reasoning("history-first")
+    cut!(original_fixture, original, first_output)
+
+    middle =
+      if transition == :expiry_then_window,
+        do: replace_expired_fixture!(original_fixture),
+        else: window_fixture(original_fixture, "#{thread}:3")
+
+    first_payload = append(fixture.payload, [first_output, mailbox(1)])
+    first = admit!(middle, first_payload, transport)
+    assert_edge!(original, first)
+    second_output = reasoning("history-second")
+    cut!(middle, first, second_output)
+
+    current =
+      case transition do
+        :second_window ->
+          window_fixture(middle, "#{thread}:4")
+
+        :replace_successor ->
+          replace_expired_fixture!(middle)
+
+        :close_original ->
+          replace_expired_fixture!(original_fixture)
+          middle
+
+        :expiry_then_window ->
+          window_fixture(middle, "#{thread}:3")
+      end
+
+    candidate = append(first_payload, [second_output, mailbox(2)])
+    second = admit!(current, candidate, transport)
+    assert_edge!(first, second)
+  end
+
+  defp assert_window_successor(fixture, predecessor_transport, successor_transport) do
+    thread = Ecto.UUID.generate()
+    fixture = window_fixture(fixture, "#{thread}:2")
+    original = admit!(fixture, fixture.payload, predecessor_transport)
+    output = reasoning("window-cut")
+    cut!(fixture, original, output)
+    Repo.update_all(from(s in CodexSession, where: s.id == ^fixture.session.id), set: [status: "interrupted"])
+    previous = Repo.get!(CodexSession, fixture.session.id)
+    assert previous.owner_lease_token
+    assert DateTime.compare(previous.owner_lease_expires_at, db_now()) == :gt
+    assert is_nil(previous.close_reason)
+    successor = window_fixture(fixture, "#{thread}:3")
+    refute successor.session.id == previous.id
+    candidate = append(fixture.payload, [output, mailbox(1)])
+    changed = append(fixture.payload, [reasoning("changed-window-output"), mailbox(1)])
+    assert_refused!(successor, changed, :terminal_predecessor)
+    assert_http_refused!(successor, changed, :terminal_predecessor)
+    admitted = admit!(successor, candidate, successor_transport)
+    assert_edge!(original, admitted)
+    assert counts(fixture) == %{requests: 2, attempts: 1, turns: 1, links: 1, settlements: 1}
+    assert Repo.get!(CodexSession, previous.id) == previous
+    assert_refused!(successor, candidate, :terminal_predecessor)
+
+    # A later cut in the new session still verifies the original cross-window edge.
+    next_output = reasoning("next-window-cut")
+    cut!(successor, admitted, next_output)
+    next = admit!(successor, append(candidate, [next_output, mailbox(2)]), successor_transport)
+    assert_edge!(admitted, next)
+  end
+
+  defp window_fixture(fixture, window) do
+    opts = RequestOptions.for_websocket(%{session_header: window, session_header_source: "x-codex-window-id"})
+    assert {:ok, session} = SessionContinuity.start_codex_session(fixture.setup.auth, opts)
+    Map.merge(fixture, %{session: session, native_window_id: window})
+  end
+
   defp admit!(fixture, payload, "websocket") do
     opts = options(fixture, payload, "websocket")
     assert {:ok, %{request: claim}} = Accounting.claim_websocket_turn(fixture.setup.auth, fixture.setup.model, opts)
@@ -310,6 +474,7 @@ defmodule CodexPooler.Accounting.MailboxResumeChainTest do
       transport: transport,
       correlation_id: fixture.claim,
       codex_session: fixture.session,
+      native_window_id: Map.get(fixture, :native_window_id),
       requested_model: fixture.setup.model.exposed_model_id,
       native_client_retry_witness: witness(fixture, payload, transport),
       native_http_input_count: length(payload["input"]),

@@ -219,6 +219,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation do
       client_ip: request_metadata.client_ip,
       user_agent: request_metadata.user_agent,
       runtime_revocation_epoch: request_options.runtime.api_key_runtime_epoch,
+      native_window_id: native_window_id(request_options),
       native_client_retry_witness: native_http_retry_witness(native_http_claim, request_options),
       native_http_input_count: native_http_input_count(native_http_claim),
       native_http_semantic_turn_key: native_http_semantic_turn_key(native_http_claim),
@@ -242,6 +243,9 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation do
         )
     }
   end
+
+  defp native_window_id(%{continuity: %{session_header_source: "x-codex-window-id", session_header: window}}), do: window
+  defp native_window_id(_request_options), do: nil
 
   defp durable_request_correlation_id(
          %RequestOptions{

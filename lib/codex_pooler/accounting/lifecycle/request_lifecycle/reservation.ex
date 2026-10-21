@@ -445,6 +445,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Reservation do
       endpoint: attr(opts, :endpoint),
       codex_session_id: session.id,
       semantic_turn_digest: attr(opts, :semantic_turn_digest),
+      native_window_id: attr(opts, :native_window_id),
       native_client_retry_witness: attr(opts, :native_client_retry_witness),
       anchor_present?: attr(opts, :anchor_present?) == true
     }
@@ -736,6 +737,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Reservation do
       model_id: model.id,
       endpoint: context.endpoint,
       codex_session_id: session.id,
+      native_window_id: attr(opts, :native_window_id),
       native_client_retry_witness: attr(opts, :native_client_retry_witness),
       native_http_input_count: attr(opts, :native_http_input_count),
       native_http_semantic_turn_key: attr(opts, :native_http_semantic_turn_key),

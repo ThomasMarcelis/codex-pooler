@@ -2752,7 +2752,7 @@ defmodule CodexPooler.Accounting.ClientRetry do
 
   @type mailbox_stage :: :no_candidate | :settlement | :authorization | :session | :witness | :ending | :output_prefix | :verified
   @type mailbox_result :: %{required(:stage) => mailbox_stage(), optional(:candidate_index) => pos_integer()}
-  @type mailbox_session_verdict :: :same_session | :expired_replacement | :rejected
+  @type mailbox_session_verdict :: :same_session | :expired_replacement | :window_successor | :rejected
 
   @doc false
   @spec mailbox_check_for_session(term(), term(), term(), term(), term(), Ecto.UUID.t() | nil, map()) :: mailbox_result()
@@ -2764,7 +2764,6 @@ defmodule CodexPooler.Accounting.ClientRetry do
   def mailbox_check_for_session(turn, request, attempt, witness, successor, _current_session_id, _scope),
     do: mailbox_check(turn, request, attempt, witness, successor, :rejected)
 
-  defp mailbox_edge_session_verdict(%CodexTurn{codex_session_id: id}, _successor, id, _scope), do: :same_session
   defp mailbox_edge_session_verdict(turn, nil, current_id, scope), do: SessionContinuity.mailbox_session_verdict(turn.codex_session_id, current_id, scope)
 
   defp mailbox_edge_session_verdict(turn, %Request{} = successor, current_id, scope) do
@@ -2772,6 +2771,10 @@ defmodule CodexPooler.Accounting.ClientRetry do
 
     case Repo.one(from next in CodexTurn, where: next.request_id == ^successor.id, lock: "FOR UPDATE") do
       %CodexTurn{codex_session_id: successor_id} -> SessionContinuity.mailbox_session_edge_verdict(turn.codex_session_id, successor_id, current_id, scope)
+      # A successor request without a turn has no stored session edge. Keep
+      # the same-session walk so that successor's live-row or settlement
+      # guard reports the refusal.
+      nil when turn.codex_session_id == current_id -> :same_session
       nil -> :rejected
     end
   end
@@ -2788,7 +2791,7 @@ defmodule CodexPooler.Accounting.ClientRetry do
     cond do
       not mailbox_settled_rows?(turn, request, attempt) -> %{stage: :settlement}
       not mailbox_authorized?(request, witness) -> %{stage: :authorization}
-      session_verdict not in [:same_session, :expired_replacement] -> %{stage: :session}
+      session_verdict not in [:same_session, :expired_replacement, :window_successor] -> %{stage: :session}
       true -> mailbox_candidates_check(turn, request, attempt, candidates, successor)
     end
   end

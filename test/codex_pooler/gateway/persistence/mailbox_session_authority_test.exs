@@ -67,6 +67,100 @@ defmodule CodexPooler.Gateway.Persistence.MailboxSessionAuthorityTest do
     assert {:ok, :rejected} = SessionContinuity.mailbox_admission_transaction(fn -> [ctx.current.id] end, fn -> SessionContinuity.mailbox_session_verdict(ctx.previous.id, ctx.current.id, ctx.scope) end, :unexpected_rediscovery)
   end
 
+  test "adjacent window authority preserves both owned sessions", ctx do
+    ctx = window_context(ctx)
+    assert verdict(ctx) == :window_successor
+    assert Repo.get!(CodexSession, ctx.previous.id) == ctx.previous
+    assert Repo.get!(CodexSession, ctx.current.id) == ctx.current
+  end
+
+  for mutation <- [:different_thread, :reverse_window, :skipped_window, :wrong_current_key, :missing_window, :malformed_window, :wrong_pool_scope, :wrong_key_scope, :foreign_key, :foreign_pool, :closed_previous, :closed_current, :live_previous, :live_current] do
+    test "#{mutation} cannot establish window successor authority", ctx do
+      ctx = ctx |> window_context() |> mutate_window(unquote(mutation))
+      assert verdict(ctx) == :rejected
+    end
+  end
+
+  test "historical window edges are bounded by the resolver's supported depth", ctx do
+    thread = Ecto.UUID.generate()
+    previous = start_window!(ctx.auth, "#{thread}:2")
+    successor = start_window!(ctx.auth, "#{thread}:3")
+    current = start_window!(ctx.auth, "#{thread}:18")
+    scope = Map.merge(ctx.scope, %{native_window_id: "#{thread}:18"})
+    assert edge_verdict(previous, successor, current, scope) == :window_successor
+    next = start_window!(ctx.auth, "#{thread}:19")
+    assert edge_verdict(previous, successor, next, %{scope | native_window_id: "#{thread}:19"}) == :rejected
+    assert edge_verdict(previous, successor, current, %{scope | native_window_id: "#{Ecto.UUID.generate()}:18"}) == :rejected
+    assert edge_verdict(successor, previous, current, scope) == :rejected
+    assert edge_verdict(previous, current, current, scope) == :rejected
+  end
+
+  for side <- [:live_previous, :live_current] do
+    test "#{side} unrelated work does not revoke a settled historical window edge", ctx do
+      ctx = ctx |> window_context() |> mutate_window(unquote(side))
+      assert edge_verdict(ctx.previous, ctx.current, ctx.current, ctx.scope) == :window_successor
+      assert verdict(ctx) == :rejected
+    end
+  end
+
+  defp edge_verdict(previous, successor, current, scope) do
+    ids = [previous.id, successor.id, current.id]
+    assert {:ok, result} = SessionContinuity.mailbox_admission_transaction(fn -> ids end, fn -> SessionContinuity.mailbox_session_edge_verdict(previous.id, successor.id, current.id, scope) end, :unexpected_rediscovery)
+    result
+  end
+
+  defp window_context(ctx) do
+    thread = Ecto.UUID.generate()
+    previous = start_window!(ctx.auth, "#{thread}:2")
+    Repo.update_all(from(s in CodexSession, where: s.id == ^previous.id), set: [status: "interrupted"])
+    current = start_window!(ctx.auth, "#{thread}:3")
+    %{ctx | previous: Repo.get!(CodexSession, previous.id), current: current, scope: Map.put(ctx.scope, :native_window_id, "#{thread}:3")}
+  end
+
+  defp start_window!(auth, window) do
+    options = RequestOptions.for_websocket(%{session_header: window, session_header_source: "x-codex-window-id"})
+    assert {:ok, session} = SessionContinuity.start_codex_session(auth, options)
+    session
+  end
+
+  defp mutate_window(ctx, :different_thread), do: %{ctx | previous: start_window!(ctx.auth, "#{Ecto.UUID.generate()}:2")}
+  defp mutate_window(ctx, :reverse_window), do: %{ctx | previous: start_window!(ctx.auth, String.replace_suffix(ctx.scope.native_window_id, ":3", ":4"))}
+  defp mutate_window(ctx, :skipped_window), do: %{ctx | previous: start_window!(ctx.auth, String.replace_suffix(ctx.scope.native_window_id, ":3", ":1"))}
+  defp mutate_window(ctx, :wrong_current_key), do: %{ctx | current: start_window!(ctx.auth, "#{Ecto.UUID.generate()}:3")}
+  defp mutate_window(ctx, :missing_window), do: %{ctx | scope: Map.delete(ctx.scope, :native_window_id)}
+  defp mutate_window(ctx, :malformed_window), do: %{ctx | scope: Map.put(ctx.scope, :native_window_id, String.replace_suffix(ctx.scope.native_window_id, ":3", ":03"))}
+  defp mutate_window(ctx, mutation) when mutation in [:wrong_pool_scope, :wrong_key_scope], do: mutate(ctx, mutation)
+
+  defp mutate_window(ctx, :foreign_key) do
+    %{api_key: key} = active_api_key_fixture(ctx.auth.pool)
+    update_previous(ctx, api_key_id: key.id)
+    ctx
+  end
+
+  defp mutate_window(ctx, :foreign_pool) do
+    %{pool: pool, api_key: key} = active_api_key_fixture()
+    previous = start_window!(%{pool: pool, api_key: key}, String.replace_suffix(ctx.scope.native_window_id, ":3", ":2"))
+    %{ctx | previous: previous}
+  end
+
+  defp mutate_window(ctx, :closed_previous) do
+    update_previous(ctx, status: "closed", closed_at: db_now())
+    ctx
+  end
+
+  defp mutate_window(ctx, :closed_current) do
+    Repo.update_all(from(s in CodexSession, where: s.id == ^ctx.current.id), set: [status: "closed", closed_at: db_now()])
+    ctx
+  end
+
+  defp mutate_window(ctx, side) when side in [:live_previous, :live_current] do
+    session = if side == :live_previous, do: ctx.previous, else: ctx.current
+    request = request_fixture(ctx.auth, %{status: "in_progress", completed_at: nil})
+    now = db_now()
+    Repo.insert!(%CodexTurn{codex_session_id: session.id, request_id: request.id, turn_sequence: 1, transport_kind: "http_sse", status: "in_progress", started_at: now, created_at: now, updated_at: now})
+    ctx
+  end
+
   defp verdict(ctx) do
     {:ok, verdict} = SessionContinuity.mailbox_admission_transaction(fn -> Repo.all(from s in CodexSession, where: s.id in ^[ctx.previous.id, ctx.current.id], select: s.id) end, fn -> SessionContinuity.mailbox_session_verdict(ctx.previous.id, ctx.current.id, ctx.scope) end, :unexpected_rediscovery)
     verdict

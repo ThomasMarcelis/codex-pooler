@@ -55,6 +55,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.FailedPredecessorResend do
           required(:model_id) => Ecto.UUID.t(),
           required(:endpoint) => String.t() | nil,
           optional(:codex_session_id) => Ecto.UUID.t(),
+          optional(:native_window_id) => String.t() | nil,
           optional(:semantic_turn_digest) => <<_::256>> | nil,
           optional(:native_client_retry_witness) => ClientRetry.OriginalWitness.t() | nil,
           optional(:native_http_input_count) => non_neg_integer() | nil,
@@ -564,8 +565,9 @@ defmodule CodexPooler.Accounting.RequestLifecycle.FailedPredecessorResend do
   defp validate_semantic_retry(_request, _shape, _scope, _chain_edges), do: :ok
 
   # The thread-scoped claim and sealed witness stay identical across a window
-  # or session replacement. Only proven execution death can relax the session
-  # fence; every other retry shape keeps its original session binding.
+  # or session replacement. These retry shapes relax the session fence only
+  # for proven execution death; a mailbox continuation proves its session
+  # in MailboxSessionAuthority.
   defp semantic_retry_session_matches?(%CodexTurn{} = turn, request, attempt, scope),
     do: turn.codex_session_id == Map.get(scope, :codex_session_id) or ClientRetry.verified_dead_execution?(turn, request, attempt)
 

@@ -817,14 +817,20 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity do
   defp session_header_session_key(%RequestOptions{
          continuity: %{session_header_source: "x-codex-window-id", session_header: session_header}
        }) do
-    case blank_to_nil(session_header) do
-      nil -> nil
-      value -> "x-codex-window-id:" <> safe_hash(value)
-    end
+    window_session_key(session_header)
   end
 
   defp session_header_session_key(%RequestOptions{continuity: %{session_header: session_header}}) do
     blank_to_nil(session_header)
+  end
+
+  @doc false
+  @spec window_session_key(String.t() | nil) :: String.t() | nil
+  def window_session_key(header) do
+    case blank_to_nil(header) do
+      nil -> nil
+      value -> "x-codex-window-id:" <> safe_hash(value)
+    end
   end
 
   defp safe_hash(value) when is_binary(value) do
